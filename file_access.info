@@ -1,0 +1,4 @@
+; $Id: file_access.info 23 2009-06-16 22:39:02Z matt $
+name = File Access
+description = Allows for individual file access control when using the Private setting in the File System.
+core = 6.x

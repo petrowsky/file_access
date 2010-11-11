@@ -1,0 +1,66 @@
+<?php
+// $Id: file_access.install 39 2009-07-07 21:32:20Z matt $
+
+ 
+/**
+ * Implementation of hook_install().
+ */
+function file_access_install() {
+  drupal_install_schema('file_access');
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function file_access_uninstall() {
+  drupal_uninstall_schema('file_access');
+  // Remove variables
+  $vars = array('file_access_global_roles',
+                'file_access_per_node',
+                'file_access_redirect',
+                'file_access_extensions',
+                );
+  foreach ($vars as $name) {
+    variable_del($name);
+  }
+}
+
+/**
+ * Implementation of hook_schema.
+ */
+function file_access_schema() {
+
+  $schema['file_access'] = array(
+    'description' => 'Stores file ids with associated object ids to control file access.',
+    'fields' => array(
+      'fid'  => array(
+        'description' => 'File id value from files table',
+        'type' => 'int',
+        'not null' => TRUE),
+      'nid'  => array(
+        'description' => 'Node id value to qualify access by node',
+        'type' => 'int',
+        'not null' => FALSE),
+      'aid'  => array(
+        'description' => 'Access id qualified by Drupal object type field',
+        'type' => 'int',
+        'not null' => TRUE),
+      'type' => array(
+        'description' => 'Type of access: defined by code, defaults to role',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'size' => 'tiny',
+        'default' => 0),
+      'altfid'  => array(
+        'description' => 'Alternate file id when no access returned - future feature',
+        'type' => 'int'),
+    ),
+    'indexes' => array(
+      'fid' => array('fid'),
+      'nid' => array('nid'),
+      ),
+  );
+
+  return $schema;
+}

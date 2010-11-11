@@ -1,0 +1,552 @@
+<?php
+// $Id: file_access.module 50 2009-09-08 07:01:26Z matt $
+
+/** 
+ * @todo Create a routine to kill all per node entries if option is disabled? Currently, it's an either or situation.
+ * @todo Break out upload & filefield support into supporting modules or files? Code is so little, warranted?
+ * @todo Put lock icon on protected files
+ */
+
+/**
+ * @file
+ * Allows files attached to nodes to be access controlled.
+ */
+define('FILE_ACCESS_ROLE', 0);
+define('FILE_ACCESS_USER', 1);
+
+/**
+ * Implementation of hook_perm().
+ */
+function file_access_perm() {
+  return array('administer file access', 'set file access');
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function file_access_menu() {
+  $items['admin/settings/file_access'] = array(
+    'description' => 'File access settings.',
+    'title' => 'File access',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('file_access_admin_settings'),
+    'access arguments' => array('administer file access'),
+  );
+  return $items;
+}
+
+/**
+ * Helper function for administration and settings.
+ * Determines if download method is set to private
+ */
+function file_access_valid_setup() {
+  return variable_get('file_downloads', FILE_DOWNLOADS_PUBLIC) == FILE_DOWNLOADS_PRIVATE;
+}
+
+/**
+ * Admin settings form
+ */
+function file_access_admin_settings() {
+  if (!file_access_valid_setup()) {
+    $form['file_access_notices'] = array(
+      '#type' => 'markup',
+      '#value' => t("In order for the File Access module to protect access to files, you will need to set the " . l(t('File system'), 'admin/settings/file-system', array( 'query' => drupal_get_destination()))) . t(' download method to Private.'),
+    );
+    drupal_set_message(t('File access module only works when the file system is set to private. See note below.'), 'warning');
+  }
+  // Global access settings
+  $form['file_access_global_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Global file access overrides'),
+    '#description' => t('Here you can set the global access to all files according to roles or users.')
+  );
+  $form['file_access_global_settings']['file_access_global_roles'] = array(
+    '#type' => 'checkboxes',
+    '#description' => t('Set the roles which will have global access to any file offered through Drupal\'s private method in File system.'),
+    '#title' => t('Global role access'),
+    "#default_value" => variable_get('file_access_global_roles', array()),
+    '#options' => user_roles(),
+  );
+  // Per node access control
+  $form['file_access_per_node_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Control access per node'),
+    '#description' => t('There may be situations where the same file is linked to multiple content items. In this case, you may wish to provide access on one item but not another. Leaving this unchecked, means any user or role given access, on any content item, will have universal access to that file.'),
+  );
+  $form['file_access_per_node_settings']['file_access_per_node'] = array(
+    '#type' => 'checkbox',
+    '#description' => t('Note: This only affects file access settings made after it has been checked. Any files using file access prior to this change, will not be accessible until udpated on their corresponding node.'),
+    '#title' => t('Force access check per node'),
+    "#default_value" => variable_get('file_access_per_node', 0),
+  );
+  // No access redirect settings
+  $form['file_access_no_access_redirect'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('No access options'),
+    '#description' => t('These settings control what happens when a user does not have access to the selected file.'),
+  );
+  $form['file_access_no_access_redirect']['file_access_redirect'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Redirect'),
+    '#description' => t('Specify the path you wish to redirect a user to. Leave empty if you just want the default Access Denied. (e.g. node/123 or support/subscribe-now)'),
+    '#default_value' => variable_get('file_access_redirect', ''),
+    '#size' => 40,
+  );
+  // Protected extensions settings
+  $form['file_access_protected_extensions'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Protected extensions'),
+    '#description' => t('Specify the extensions you wish to protect from download. Leaving this area blank means all files uploaded with be protected by file access.'),
+  );
+  $form['file_access_protected_extensions']['file_access_extensions'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Extensions'),
+    '#description' => t('Enter the extensions without the period and use a space between them. (e.g. mov mp3 m4a mp4 m4v)'),
+    '#default_value' => variable_get('file_access_extensions', ''),
+    '#size' => 40,
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Get array of roles with global access
+ *
+ * @return array
+ */
+function file_access_get_global_roles() {
+  $roles = variable_get('file_access_global_roles', array());
+  return array_filter($roles);
+}
+
+
+/**
+ * Implementation of hook_file_download().
+ * When accounting for access per node,
+ * because hook_file_download only uses the $filepath
+ * and is unaware of which node is offering the file
+ * this isn't the best method for ensuring true access per node.
+ * Until files are top level items this is the best we got (I think)
+ * I'm currently unaware of any modules which share files across
+ * nodes (file_reference maybe?) but the per node checking should
+ * account for this I think (hope).
+ *
+ * @todo Add option on user/x/edit for global access for that user.
+ */
+function file_access_file_download($filepath) {
+  global $user;
+  // Check global role access first and return if found
+  $global_access = file_access_get_global_roles();
+  $user_role_ids = array_keys($user->roles);
+  foreach ($user_role_ids as $rid) {
+    if (in_array($rid, $global_access)) {
+      return;
+    }
+  }
+  // Get file access settings from tables
+  $filepath = file_create_path($filepath);
+  // Per node access checking
+  if (variable_get('file_access_per_node', 0)) {
+    $access = array();
+    // Unfortunately, we don't know if the file is an upload file or filefield file - gotta do both.
+    $upload_file_access = file_access_get_access_upload_file($filepath);
+    $filefield_file_access = file_access_get_access_filefield_file($filepath);
+    // Better way to do this?
+    $access = is_array($upload_file_access) ? array_merge($access, $upload_file_access) : $access;
+    $access = is_array($filefield_file_access) ? array_merge($access, $filefield_file_access) : $access;
+    foreach ($access as $access_row) {
+      // Check for role or user specific access
+      if ($access_row->type == FILE_ACCESS_ROLE && in_array($access_row->aid, $user_role_ids) ||
+          $access_row->type == FILE_ACCESS_USER && $access_row->aid == $user->uid) {
+        return;
+      }
+    }
+  }
+  else {
+    // Otherwise simply grab the access rows for specified file
+    $result = db_query("SELECT a.* FROM {files} f INNER JOIN {file_access} a ON f.fid = a.fid WHERE filepath = '%s'", $filepath);
+    while ($access_row = db_fetch_object($result)) {
+      // Check for role or user specific access
+      if ($access_row->type == FILE_ACCESS_ROLE && in_array($access_row->aid, $user_role_ids) ||
+          $access_row->type == FILE_ACCESS_USER && $access_row->aid == $user->uid) {
+        return;
+      }
+    }
+  }
+  // Redirect if supplied in admin settings
+  if ($path = drupal_get_normal_path(variable_get('file_access_redirect', ''))) {
+    drupal_goto($path);
+  }
+  // Default is to block access to all files protected by file access - unless granted by file access
+  $ext = pathinfo($filepath, PATHINFO_EXTENSION);
+  $extensions = explode(' ', variable_get('file_access_extensions', ''));
+  if (!empty($extensions) && !in_array($ext, $extensions)) {
+    return;
+  }
+  else {
+    return -1;
+  }
+}
+
+/**
+ * Get 'per node' file access from uploads.
+ * Only find files specified with per node access
+ * who have a matching node in uploads table
+ */
+function file_access_get_access_upload_file($filepath) {
+  if (module_exists('upload')) {
+    $access = array();
+    $filepath = file_create_path($filepath);
+    $result = db_query("SELECT a.* FROM {files} f INNER JOIN {file_access} a ON f.fid = a.fid INNER JOIN {upload} u ON a.nid = u.nid WHERE filepath = '%s' AND a.fid = u.fid AND a.nid = u.nid", $filepath);
+    while ($access_row = db_fetch_object($result)) {
+      $access[] = $access_row;
+    }
+    return $access;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Get per node file access from filefields.
+ */
+function file_access_get_access_filefield_file($filepath) {
+  if (module_exists('filefield')) {
+    $access = array();
+    $filepath = file_create_path($filepath);
+    foreach (content_fields() as $field) {
+      if ($field['type'] == 'filefield') {
+        $db_info = content_database_info($field);        
+        $table = $db_info['table'];
+        $fid_column = $db_info['columns']['fid']['column'];
+
+        $result = db_query("SELECT a.* FROM {files} f INNER JOIN {file_access} a ON f.fid = a.fid INNER JOIN {". $table ."} t ON a.nid = t.nid WHERE filepath = '%s' AND a.fid = t.". $fid_column, $filepath);
+        while ($access_row = db_fetch_object($result)) {
+          $access[] = $access_row;
+        }
+      }
+    }    
+    return $access;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Remove file access from the table.
+ */
+function file_access_remove_file_access($fid, $aid, $nid = NULL, $type = FILE_ACCESS_ROLE) {
+  // Deleting a node should remove all per node access rows
+  if ($aid == 'all' && !empty($nid)) {
+    return db_query("DELETE FROM {file_access} WHERE nid = %d", $nid);
+  }
+  return db_query("DELETE FROM {file_access} WHERE fid = %d AND aid = %d AND nid = %d AND type = %d", $fid, $aid, $nid, $type);
+}
+
+/**
+ * Set file access for a file.
+ *
+ * File access is controlled based on the 'type' of access
+ * Role access is the default type and user access must
+ * be specified.
+ *
+ * @param $fid
+ *   Drupal file id (as from the files table).
+ * @param $aid
+ *   Access id. Because access can be type 'role' or type 'user'.
+ * @param $nid
+ *   Node id is used when 'per node' access checking is turned on. Default is null
+ * @param $type
+ *   Whether the type is role-based or user-based, as controled by defined variables
+ * @return
+ *   TRUE if access was set, otherwise FALSE
+ */
+function file_access_set_file_access($fid, $aid, $nid = NULL, $type = FILE_ACCESS_ROLE) {
+  // Make sure role exists if type is FILE_ACCESS_ROLE -- only potential overlap is user ids in same range as role keys
+  if ($type == FILE_ACCESS_ROLE && !array_key_exists($aid, user_roles())) {
+    return FALSE;
+  }
+  // Get current access to see if it exists
+  $per_node = variable_get('file_access_per_node', 0);
+  $result = db_query("SELECT * FROM {file_access} WHERE fid = %d AND aid = %d AND nid = %d AND type = %d", $fid, $aid, $nid, $type);
+  // Update the file access if per_node access has been turned on.
+  if ($file = db_fetch_object($result)) {
+    if (db_query('UPDATE {file_access} SET nid = %d  WHERE fid = %d AND aid = %d AND type = %d', $nid, $fid, $aid, $type)) {
+      return TRUE;
+    }
+  }
+  else {
+    // Otherwise insert a new file access row if none found
+    if (db_query('INSERT INTO {file_access} (fid, nid, aid, type) VALUES(%d, %d, %d, %d)', $fid, $nid, $aid, $type)) {
+      return TRUE;
+    }
+  }
+  
+  return FALSE;
+}
+
+/**
+ * Get file access for a file.
+ *
+ * File access is controlled based on the 'type' of access
+ * Role access is the default type and user access must
+ * be specified.
+ *
+ * @param $fid
+ *   Drupal file id (as from the files table).
+ * @param $nid
+ *   Node id is used when 'per node' access checking is turned on. Default is null
+ * @return
+ *   Array of access objects containing fid, aid, nid, type
+ */
+function file_access_get_file_access($fid, $nid = NULL) {
+  $file_access = array();
+  $result = db_query("SELECT * FROM {file_access} WHERE fid = '%d' AND nid = %d", $fid, $nid);
+  while ($file = db_fetch_object($result)) {
+    $file_access[$file->aid] = $file;
+  }
+  
+  return $file_access;
+}
+
+
+/**
+ * Get possible filefield fields from content module.
+ * Check for filefield module, which has CCK dependancy
+ */
+function file_access_node_get_filefields($node) {
+  // Should I move this to the form_alter and just get #field_info from the $form? Better performance?
+  if (!module_exists('filefield')) {
+    return FALSE;
+  }
+  else {
+    $filefields = array();
+    // Cycle through content fields looking for a match on node
+    foreach (content_fields() as $name => $settings) {
+      if ($settings['type'] == 'filefield' && $node->$name) {
+        // Cycle through each file in the field
+        foreach ($node->$name as $file) {
+          $filefields[$file['fid']] = $file;
+        }
+        // $filefields[$name] = $node->$name;
+      }
+    }
+    if (empty($filefields)) {
+      return FALSE;
+    }
+    else {
+      return $filefields;
+    }
+  }
+}
+
+/**
+ * Get possible files from the upload module.
+ */
+function file_access_node_get_uploads($node) {
+  // Get the files right from the upload module because nodeapi may not have then on the node yet
+  if (!module_exists('upload')) {
+    return FALSE;
+  }
+  else {
+    $files = array();
+    // $uploads = $node->files;
+    $uploads = upload_load($node); // yet another db_query
+    if (!empty($uploads)) {
+      foreach ($uploads as $key => $item) {
+        $files[$key] = (array)$item;
+      }
+    }
+    if (empty($files)) {
+      return FALSE;
+    }
+    else {
+      return $files;
+    }
+  }
+}
+
+/**
+ * Get the files from a node.
+ *
+ * Because multiple file based modules may be used.
+ */
+function file_access_node_get_files($node) {
+  $files = array();
+  // Get files from Drupal's Upload module (stored as objects)
+  $uploads = file_access_node_get_uploads($node);
+  // Get files from fieldfield fields (stored as array)
+  $filefields = file_access_node_get_filefields($node);
+  // Combine the results into one array
+  $files = is_array($uploads) ? array_merge($files, $uploads) : $files;
+  $files = is_array($filefields) ? array_merge($files, $filefields) : $files;
+  // Filter out files which are not protected by file access
+  $extensions = variable_get('file_access_extensions', '');
+  if (!empty($extensions)) {
+    $extensions = explode(' ', $extensions);
+    foreach ($files as $index => $settings) {
+      $ext = pathinfo($settings['filepath'], PATHINFO_EXTENSION);
+      if (!in_array($ext, $extensions)) {
+        unset($files[$index]);
+      }
+    }
+  }
+  return array_filter($files);
+}
+
+/**
+ * Returns an array similar to that returned by user_roles.
+ */
+function file_access_get_role_access($fid, $nid = NULL) {
+  $roles = array();
+  $file_access = file_access_get_file_access($fid, $nid);
+  foreach ($file_access as $aid => $access) {
+    if ($access->type == FILE_ACCESS_ROLE) {
+      $roles[$aid] = $aid;
+    }
+  }
+  return $roles;
+}
+
+/**
+ * Implementation of hook_nodeapi().
+ *
+ * @todo Remove in Drupal 7.
+ */
+function file_access_nodeapi(&$node, $op, $teaser, $page) {
+  switch ($op) {
+    case 'insert':
+    case 'update':
+      // Do something on update?
+      break;
+      
+    case 'view':
+      // Do something on view
+      // If valid_setup then use javascript to hide or gray out global role access
+      break;
+      
+    case 'load':
+      $access = file_access_load($node);
+      if (!empty($access)) {
+        return array('file_access' => $access);
+      }
+      break;
+      
+    case 'delete':
+        return file_access_delete($node->nid);
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_load().
+ * @todo load user access onto the node
+ */
+function file_access_load($node) {
+  $access = array();
+  $nid = file_access_use_nid($node);
+  $files = file_access_node_get_files($node);
+  foreach ($files as $file) {
+    $fid = $file['fid'];
+    $access['roles'][$fid] = array_merge(file_access_get_global_roles(), file_access_get_role_access($fid, $nid));
+  }
+  return $access;
+}
+
+/**
+ * Implementation of hook_delete().
+ * 
+ * No hook_file_delete() yet. So we don't know if this is the last
+ * node with a given file. It is possible that a file can be
+ * deleted and we end up with orphaned file access rows when not using
+ * per node access checking - may need to write a cron cleanup task?
+ */
+function file_access_delete($nid) {
+  // Delete any per_node specific file_access rows when node is deleted
+  file_access_remove_file_access(-1, 'all', $nid);
+}
+
+/**
+ * Helper function for option to force access per_node
+ */
+function file_access_use_nid(&$node) {
+  // Set node id if using per_node access
+  return variable_get('file_access_per_node', 0)? $node->nid : NULL;
+}
+
+/**
+ * Implementation of hook_form_alter(). Adds the file access fieldset to the node form.
+ * Add the possible roles which may access files.
+ *
+ * @todo Gray out checkboxes with global access using js
+ * @todo Alter the form using ajax (see filefield module) when node has not been submitted
+ * @todo Show files with per node access if option is turned off? Currently not showing when option is turned off.
+ */
+function file_access_form_alter(&$form, $form_state, $form_id) {
+  // Add file access to node form only if download method is private
+  if (isset($form['type']) && isset($form['#node']) && file_access_valid_setup()) {
+    $node = $form['#node'];    
+    $files = file_access_node_get_files($node);   
+    // Set node id if using per_node access
+    $nid = file_access_use_nid($node);
+    if (!empty($files)) {
+      $form['file_access'] = array(
+        '#type' => 'fieldset',
+        '#access' => user_access('set file access'),
+        '#tree' => TRUE,
+        '#title' => t('File access'),
+        '#collapsible' => TRUE,
+        '#collapsed' => TRUE,
+        '#description' => t('Set access for each file attached to this post.'),
+        '#prefix' => '<div class="file-access">',
+        '#suffix' => '</div>',
+        '#weight' => 31,
+      );
+      foreach ($files as $file) {
+        $access = file_access_get_role_access($file['fid'], $nid); // Get access from file_access table
+        $access = array_merge($access, variable_get('file_access_global_roles', array())); // Show global role access too
+        $form['file_access']['roles'][$file['fid']] = array(
+          '#type' => 'checkboxes',
+          '#description' => t('Roles'),
+          '#title' => $file['filename'],
+          "#default_value" => $access,
+          '#options' => user_roles(),
+        );
+        $form['file_access']['files'][$file['fid']] = array(
+          '#type' => 'hidden',
+          '#value' => $file['filename'],
+        );
+      }
+      $form['#submit'][] = 'file_access_node_form_submit';
+    }
+  }
+}
+
+/**
+ * Form submit for the node
+ *
+ * @todo only display message if settings for files have been changed - compare form to submitted form?
+ */
+function file_access_node_form_submit($form, &$form_state) {  
+  // Use node id if per_node access checking is turned on
+  $nid = variable_get('file_access_per_node', 0) ? $form['#node']->nid : NULL;
+  // Get role-based file access settings
+  $role_access = $form_state['values']['file_access']['roles'];
+  // Process role file access
+  foreach ($role_access as $fid => $access) {
+    $access = array_diff_key($access, file_access_get_global_roles()); // Filter out roles with global access (php5 required)
+    foreach ($access as $role => $rid) {
+      if (empty($rid)) {
+        file_access_remove_file_access($fid, $role, $nid);
+      }
+      elseif (file_access_set_file_access($fid, $rid, $nid)) {
+        // Provide message about successful changes
+        // @fixme: make this only show if settings are changed for a given file
+        drupal_set_message(t("File access has been udpated for %file", array('%file' => $form_state['values']['file_access']['files'][$fid])));
+      }
+    }
+  }
+  // Process user file access here - currently no UI for this on the node
+  return TRUE;
+}
